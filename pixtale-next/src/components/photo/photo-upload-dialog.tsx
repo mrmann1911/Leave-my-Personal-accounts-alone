@@ -1,0 +1,875 @@
+"use client"
+
+import { createContext, memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent, type RefObject } from "react"
+import { CheckIcon, CircleAlertIcon, PlusIcon, RedoDot, SettingsIcon, Video } from "lucide-react"
+import { toast } from "sonner"
+import { sha1 } from "hash-wasm"
+
+import { Button } from "@/components/ui/button"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import {
+  Drawer,
+  DrawerContent,
+  DrawerDescription,
+  DrawerFooter,
+  DrawerHeader,
+  DrawerTitle,
+} from "@/components/ui/drawer"
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import { useMasonry, usePositioner, type Positioner, type RenderComponentProps } from "masonic"
+import { OverlayScrollbars } from "overlayscrollbars"
+import { PhotoUploadSettings, readPhotoUploadSettings } from "@/components/photo/photo-upload-settings"
+import { getMediaType } from "@/lib/media"
+import { COVER_SIZE, createPhotoCover } from "@/lib/upload-cover"
+import { useStorageStore } from "@/store/storage-store"
+import { usePhotoStore } from "@/store/photo-store"
+import { useAlbumStore } from "@/store/album-store"
+import { photoExists } from "@/request/photo"
+import { type PhotoAddResultVo } from "@/server/entity/vo/photo"
+import { type StorageSelectVo } from "@/server/entity/vo/storage"
+import { useTranslations } from "next-intl"
+import { useIsMobile } from "@/hooks/use-mobile"
+
+type UploadStatus = "new" | "waiting" | "uploading" | "success" | "failed" | "skipped"
+
+interface UploadPreview {
+  id: string
+  cover?: ImageBitmap | null
+  file: File
+  albumId: string | null
+  progress: number
+  status: UploadStatus
+}
+
+type UploadGridItem = UploadPreview | { id: "add" }
+
+interface UploadGridApi {
+  onAddPhoto: () => void
+  onCover: (id: string, cover: ImageBitmap | null, generation: number) => void
+  generationRef: RefObject<number>
+  loadingIds: Set<string>
+}
+
+interface PhotoUploadHeaderProps {
+  drawer?: boolean
+}
+
+interface PhotoUploadGridProps {
+  previews: UploadPreview[]
+  generationRef: RefObject<number>
+  isMobile: boolean
+  onAddPhoto: () => void
+  onCover: (id: string, cover: ImageBitmap | null, generation: number) => void
+}
+
+const ADD_ITEM: UploadGridItem = { id: "add" }
+const UploadGridContext = createContext<RefObject<UploadGridApi> | null>(null)
+const STATUS_ICON = {
+  success: CheckIcon,
+  failed: CircleAlertIcon,
+  skipped: RedoDot,
+} as const
+
+// 判断格子是待上传文件还是末尾的添加按钮。
+function isUploadPreview(item: UploadGridItem): item is UploadPreview {
+  return "file" in item
+}
+
+// 按固定列数把每个方格高度写入 positioner，避免虚拟列表再测量隐藏节点。
+function syncUploadPositioner(count: number, columnWidth: number, positioner: Positioner) {
+  const height = Math.max(1, columnWidth)
+  const updates: number[] = []
+
+  for (let index = 0; index < count; index += 1) {
+    const current = positioner.get(index)
+
+    if (!current) {
+      positioner.set(index, height)
+    } else if (current.height !== height) {
+      updates.push(index, height)
+    }
+  }
+
+  if (updates.length) {
+    positioner.update(updates)
+  }
+}
+
+// 读取上传面板滚动容器的尺寸和滚动位置。桌面端使用和照片列表相同的滚动条。
+function useUploadScroller(isMobile: boolean) {
+  const hostRef = useRef<HTMLDivElement>(null) // 滚动条宿主，高度固定。
+  const viewportRef = useRef<HTMLDivElement>(null) // 实际上滚动的视口。
+  const [scrollTop, setScrollTop] = useState(0) // 滚动容器当前纵向位置。
+  const [size, setSize] = useState({ width: 0, height: 0 }) // 滚动容器的可视宽高。
+
+  useLayoutEffect(() => {
+    const host = hostRef.current
+    const viewport = viewportRef.current
+    if (!host || !viewport) {
+      return
+    }
+
+    const scrollbar = isMobile || window.innerWidth < 768
+      ? undefined
+      : OverlayScrollbars({
+        target: host,
+        elements: { viewport },
+      }, {
+        scrollbars: {
+          theme: "os-theme-page",
+          autoHide: "leave",
+          autoHideDelay: 800,
+        },
+      })
+    viewport.style.width = "100%"
+    viewport.style.height = "100%"
+    const offsetElement = scrollbar?.elements().scrollOffsetElement ?? viewport
+    const eventTarget = scrollbar?.elements().scrollEventElement ?? viewport
+    let frame = 0
+
+    // 记录视口宽高，供虚拟列表计算列宽和可见高度。
+    const measure = () => {
+      const width = viewport.clientWidth
+      const height = viewport.clientHeight
+      setSize((prev) => (prev.width === width && prev.height === height ? prev : { width, height }))
+    }
+    // 滚动时同步 scrollTop，让虚拟列表只保留可见格子。
+    const onScroll = () => {
+      if (frame) {
+        return
+      }
+      frame = window.requestAnimationFrame(() => {
+        frame = 0
+        setScrollTop(offsetElement.scrollTop)
+      })
+    }
+
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(viewport)
+    eventTarget.addEventListener("scroll", onScroll, { passive: true })
+
+    return () => {
+      observer.disconnect()
+      eventTarget.removeEventListener("scroll", onScroll)
+      window.cancelAnimationFrame(frame)
+      scrollbar?.destroy()
+    }
+  }, [isMobile])
+
+  return { hostRef, viewportRef, scrollTop, width: size.width, height: size.height }
+}
+
+interface PhotoUploadFooterProps {
+  fileInputRef: RefObject<HTMLInputElement | null>
+  storages: StorageSelectVo[]
+  selectedStorageId: string | null
+  uploading: boolean
+  onFileChange: (event: ChangeEvent<HTMLInputElement>) => void
+  onStorageChange: (storageId: string) => void
+  onSettingsChange: () => void
+  onReset: () => void
+  onUploadAction: () => void
+}
+
+// 在浏览器中计算待上传文件的 SHA-1 校验和。
+async function getFileChecksum(file: File) {
+  const buffer = await file.arrayBuffer()
+  return sha1(new Uint8Array(buffer))
+}
+
+// 从上传接口响应中提取错误提示，XML 优先读取 Message 标签。
+function getUploadErrorText(text: string) {
+  const value = text.trim()
+
+  try {
+    const data = JSON.parse(value) as { message?: string }
+    return data.message || value
+  } catch {
+    // 非 JSON 错误继续按普通文本或 XML 处理。
+  }
+
+  if (!value.startsWith("<") || !value.endsWith(">")) {
+    return value || "Upload failed"
+  }
+
+  const xml = new DOMParser().parseFromString(value, "text/xml")
+  const message = xml.querySelector("Message")?.textContent?.trim()
+
+  return message || value
+}
+
+// 使用 XMLHttpRequest 上传照片到 /photo/add。
+function uploadPhotoAdd(
+  formData: FormData,
+  onProgress?: (progress: number) => void,
+  registerAbort?: (abort: () => void) => void,
+) {
+  return new Promise<PhotoAddResultVo>((resolve, reject) => {
+    const request = new XMLHttpRequest()
+
+    registerAbort?.(() => request.abort())
+    request.open("POST", "/api/photo/add")
+    request.withCredentials = true
+    request.upload.onprogress = (event) => {
+      if (event.lengthComputable) {
+        onProgress?.(Math.min(95, Math.round((event.loaded / event.total) * 100)))
+      }
+    }
+    request.onload = () => {
+      try {
+        const json = JSON.parse(request.responseText) as {
+          code: number
+          message?: string
+          data?: PhotoAddResultVo
+        }
+
+        if (request.status >= 200 && request.status < 300 && json.code === 200 && json.data) {
+          onProgress?.(100)
+          resolve(json.data)
+          return
+        }
+
+        reject(new Error(json.message || getUploadErrorText(request.responseText)))
+      } catch {
+        reject(new Error(getUploadErrorText(request.responseText)))
+      }
+    }
+    request.onerror = () => reject(new Error("Upload failed"))
+    request.onabort = () => reject(new DOMException("Upload aborted", "AbortError"))
+    request.send(formData)
+  })
+}
+
+// 渲染照片上传弹窗。
+export function PhotoUploadDialog() {
+  const t = useTranslations("photos.upload")
+  // isMobile 控制上传面板在移动端使用 Dialog、桌面端使用右侧 Drawer。
+  const isMobile = useIsMobile()
+  const fileInputRef = useRef<HTMLInputElement>(null) // 文件选择 input，用于触发系统文件选择器。
+  const previewsRef = useRef<UploadPreview[]>([]) // 保存照片预览和上传状态列表。
+  const previewGenerationRef = useRef(0) // 清空或卸载后递增，用来丢弃尚未返回的封面。
+  const uploadQueueRef = useRef<UploadPreview[]>([]) // 保存待上传照片队列，支持上传中继续追加照片。
+  const uploadingRef = useRef(false) // 标记当前是否有上传任务正在运行。
+  const activeCountRef = useRef(0) // 记录当前正在上传的照片数量，用于限制并发数。
+  const abortMapRef = useRef<Map<string, () => void>>(new Map()) // 保存每张照片对应的停止上传方法。
+  const pausedRef = useRef(false) // 标记是否已暂停，防止 abort 收尾时重新启动上传。
+  const uploadStorageIdRef = useRef<string | null>(null) // 开始后锁定的存储配置 id。
+  const [uploading, setUploading] = useState(false) // 标记当前是否正在上传，用于切换开始/暂停按钮。
+  const [, setPreviewTick] = useState(0) // 预览列表变更时递增，用于触发界面刷新。
+  const storages = useStorageStore((state) => state.storages) // 全局可选存储配置列表。
+  const savedStorageId = useStorageStore((state) => state.selectedStorageId) // 持久化的上传存储配置 id。
+  const setSelectedStorageId = useStorageStore((state) => state.setSelectedStorageId) // 更新持久化的上传存储配置 id。
+  const open = usePhotoStore((state) => state.uploadOpen) // 上传弹窗是否打开。
+  const uploadAlbumId = usePhotoStore((state) => state.uploadAlbumId) // 当前上传目标相册 id。
+  const closeUpload = usePhotoStore((state) => state.closeUpload) // 关闭上传弹窗的方法。
+  const addUploadedPhoto = usePhotoStore((state) => state.addUploadedPhoto) // 上传成功后写入照片列表的方法。
+  // selectedStorageId 是当前可用的上传存储，已保存的配置失效时回退到第一项。
+  const selectedStorageId = storages.some((storage) => storage.storageId === savedStorageId)
+    ? savedStorageId
+    : storages[0]?.storageId ?? null
+
+  useEffect(() => {
+    return () => {
+      previewGenerationRef.current += 1
+      previewsRef.current.forEach((preview) => preview.cover?.close())
+    }
+  }, [])
+
+  // 更新预览列表并触发界面刷新。
+  function setPreviews(next: UploadPreview[]) {
+    previewsRef.current = next
+    setPreviewTick((tick) => tick + 1)
+  }
+
+  // 打开系统文件选择器。
+  function openFilePicker() {
+    fileInputRef.current?.click()
+  }
+
+  // 清空弹窗内已生成的预览。
+  function resetUpload() {
+    previewGenerationRef.current += 1
+    previewsRef.current.forEach((preview) => preview.cover?.close())
+    uploadQueueRef.current = []
+    uploadingRef.current = false
+    setUploading(false)
+    setPreviews([])
+  }
+
+  // 处理弹窗打开状态变化。
+  function handleOpenChange(nextOpen: boolean) {
+    if (!nextOpen) {
+      closeUpload()
+    }
+  }
+
+  // 把可见格子生成的封面写回对应预览。列表已清空时丢掉结果。
+  function setPreviewCover(id: string, cover: ImageBitmap | null, generation: number) {
+    if (generation !== previewGenerationRef.current) {
+      cover?.close()
+      return
+    }
+
+    const current = previewsRef.current.find((preview) => preview.id === id)
+    if (!current || current.cover !== undefined) {
+      cover?.close()
+      return
+    }
+
+    setPreviews(previewsRef.current.map((preview) => (
+      preview.id === id ? { ...preview, cover } : preview
+    )))
+  }
+
+  // 暂停上传，仅中断 xhr，并重置排队/正在上传的照片。
+  function pauseUpload() {
+    pausedRef.current = true
+    const abortingIds = new Set(abortMapRef.current.keys())
+    abortMapRef.current.forEach((abort) => abort())
+    abortMapRef.current.clear()
+    uploadQueueRef.current = []
+
+    const nextPreviews = previewsRef.current.map((preview) => {
+      if (preview.status === "waiting") {
+        return { ...preview, progress: 100, status: "new" as UploadStatus }
+      }
+      if (preview.status === "uploading" && abortingIds.has(preview.id)) {
+        return { ...preview, progress: 100, status: "new" as UploadStatus }
+      }
+      return preview
+    })
+
+    setPreviews(nextPreviews)
+    uploadingRef.current = false
+    setUploading(false)
+  }
+
+  // 处理选择照片后的每张新增照片。
+  async function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files ?? [])
+    event.target.value = ""
+
+    if (!files.length) {
+      return
+    }
+
+    const next = files.map((file): UploadPreview => ({
+      id: `${Math.random()}`,
+      file,
+      albumId: uploadAlbumId,
+      progress: 100,
+      status: "new",
+    }))
+
+    setPreviews([...previewsRef.current, ...next])
+  }
+
+  // 把当前符合条件的照片加入上传队列。
+  function enqueueUploadItems() {
+    const uploadList = previewsRef.current.filter((preview) => (
+      preview.status === "new" || preview.status === "failed"
+    ))
+
+    if (!uploadList.length) {
+      return 0
+    }
+
+    const uploadIds = new Set(uploadList.map((preview) => preview.id))
+
+    uploadQueueRef.current.push(...uploadList)
+
+    const nextPreviews: UploadPreview[] = previewsRef.current.map((preview) => (
+      uploadIds.has(preview.id)
+        ? { ...preview, progress: 0, status: "waiting" }
+        : preview
+    ))
+
+    setPreviews(nextPreviews)
+
+    return uploadList.length
+  }
+
+  // 上传单张照片，并按结果刷新当前照片状态。
+  async function uploadPhoto(preview: UploadPreview) {
+    const currentStorageId = uploadStorageIdRef.current!
+
+    setPreviews(previewsRef.current.map((p) => (
+      p.id === preview.id ? { ...p, progress: 0, status: "uploading" } : p
+    )))
+
+    const item = previewsRef.current.find((p) => p.id === preview.id) ?? preview
+
+    try {
+      const checksum = await getFileChecksum(item.file)
+      const existsResult = await photoExists({
+        checksum,
+        name: item.file.name,
+        albumId: item.albumId,
+      }, { showErrorToast: false })
+
+      if (existsResult.duplicate) {
+        setPreviews(previewsRef.current.map((p) => (
+          p.id === item.id ? { ...p, progress: 100, status: "skipped" } : p
+        )))
+        return
+      }
+
+      if (pausedRef.current) {
+        setPreviews(previewsRef.current.map((p) => (
+          p.id === item.id ? { ...p, progress: 100, status: "new" } : p
+        )))
+        return
+      }
+
+      const formData = new FormData()
+      formData.set("lock", item.id)
+      formData.set("storageId", currentStorageId)
+      formData.set("file", item.file)
+      formData.set("lastModified", String(item.file.lastModified))
+      if (item.albumId) {
+        formData.set("albumId", item.albumId)
+      }
+
+      const result = await uploadPhotoAdd(formData, (progress) => {
+        setPreviews(previewsRef.current.map((p) => (
+          p.id === item.id ? { ...p, progress } : p
+        )))
+      }, (abort) => abortMapRef.current.set(preview.id, abort))
+
+      if (result.duplicate) {
+        setPreviews(previewsRef.current.map((p) => (
+          p.id === item.id ? { ...p, progress: 100, status: "skipped" } : p
+        )))
+        return
+      }
+
+      if (result.photo) {
+        useAlbumStore.getState().increaseRefreshKey()
+        addUploadedPhoto(result.photo, item.albumId)
+      }
+
+      setPreviews(previewsRef.current.map((p) => (
+        p.id === item.id ? { ...p, progress: 100, status: "success" } : p
+      )))
+
+    } catch (error) {
+
+      if (error instanceof DOMException && error.name === "AbortError") {
+        return
+      }
+
+      if (error instanceof Error) {
+        toast.error(error.message, {
+          position: isMobile ? "top-center" : "bottom-center",
+        })
+        console.error(error.message)
+      }
+
+      if (readPhotoUploadSettings().retryOnFail) {
+        uploadQueueRef.current.push(item)
+        setPreviews(previewsRef.current.map((p) => (
+          p.id === item.id ? { ...p, progress: 0, status: "waiting" } : p
+        )))
+        return
+      }
+
+      setPreviews(previewsRef.current.map((p) => (
+        p.id === item.id ? { ...p, progress: 100, status: "failed" } : p
+      )))
+    } finally {
+      abortMapRef.current.delete(preview.id)
+    }
+  }
+
+  // 每次请求结束后马上补下一个，并发数由上传设置决定。
+  function runNext() {
+    if (pausedRef.current) {
+      return
+    }
+
+    if (!uploadQueueRef.current.length && activeCountRef.current === 0) {
+      uploadingRef.current = false
+      setUploading(false)
+      return
+    }
+
+    uploadingRef.current = true
+    setUploading(true)
+    const concurrency = readPhotoUploadSettings().concurrency
+
+    while (activeCountRef.current < concurrency && uploadQueueRef.current.length) {
+      const preview = uploadQueueRef.current.shift()
+
+      if (!preview) {
+        continue
+      }
+
+      activeCountRef.current += 1
+      uploadPhoto(preview).finally(() => {
+        activeCountRef.current -= 1
+        runNext()
+      })
+    }
+  }
+
+  // 上传弹窗内待处理的照片，成功后通知父页面。
+  function startUpload() {
+    if (process.env.NEXT_PUBLIC_DEMO_USERNAME && previewsRef.current.length > 0) {
+      toast.error("The application is running in read-only mode.", {
+        position: isMobile ? "top-center" : "bottom-center",
+      })
+      return
+    }
+
+    if (!selectedStorageId && previewsRef.current.length > 0) {
+      toast.error(t("invalidStorage"), {
+        position: isMobile ? "top-center" : "bottom-center",
+      })
+      return
+    }
+
+    pausedRef.current = false
+    uploadStorageIdRef.current = selectedStorageId
+    const count = enqueueUploadItems()
+
+    if (!count && uploadingRef.current) {
+      return
+    }
+
+    runNext()
+  }
+
+  // 切换开始或暂停上传。
+  function handleUploadAction() {
+    if (uploading) {
+      pauseUpload()
+      return
+    }
+
+    startUpload()
+  }
+
+  if (isMobile) {
+    return (
+      <Dialog open={open} onOpenChange={handleOpenChange}>
+        <DialogContent className="grid h-[80vh] max-h-[720px] min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] sm:max-w-2xl">
+          <PhotoUploadHeader />
+          <div className="h-full min-h-0 overflow-hidden">
+            <PhotoUploadGrid
+              previews={previewsRef.current}
+              generationRef={previewGenerationRef}
+              isMobile={isMobile}
+              onAddPhoto={openFilePicker}
+              onCover={setPreviewCover}
+            />
+          </div>
+          <DialogFooter className="flex-row items-center justify-between gap-3 sm:justify-between">
+            <PhotoUploadFooter
+              fileInputRef={fileInputRef}
+              storages={storages}
+              selectedStorageId={selectedStorageId}
+              uploading={uploading}
+              onFileChange={handleFileChange}
+              onStorageChange={setSelectedStorageId}
+              onSettingsChange={runNext}
+              onReset={resetUpload}
+              onUploadAction={handleUploadAction}
+            />
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    )
+  }
+
+  return (
+    <Drawer direction="right" open={open} onOpenChange={handleOpenChange}>
+      <DrawerContent className="h-dvh w-full min-w-0 !max-w-xl rounded-none border-l !sm:max-w-xl">
+        <PhotoUploadHeader drawer />
+        <div className="min-h-0 flex-1 overflow-hidden px-4">
+          <PhotoUploadGrid
+            previews={previewsRef.current}
+            generationRef={previewGenerationRef}
+            isMobile={isMobile}
+            onAddPhoto={openFilePicker}
+            onCover={setPreviewCover}
+          />
+        </div>
+        <DrawerFooter className="flex-row items-center justify-between gap-3">
+          <PhotoUploadFooter
+            fileInputRef={fileInputRef}
+            storages={storages}
+            selectedStorageId={selectedStorageId}
+            uploading={uploading}
+            onFileChange={handleFileChange}
+            onStorageChange={setSelectedStorageId}
+            onSettingsChange={runNext}
+            onReset={resetUpload}
+            onUploadAction={handleUploadAction}
+          />
+        </DrawerFooter>
+      </DrawerContent>
+    </Drawer>
+  )
+}
+
+// 渲染上传面板标题，并根据容器类型使用对应的无障碍标题组件。
+function PhotoUploadHeader({ drawer = false }: PhotoUploadHeaderProps) {
+  const t = useTranslations("photos.upload")
+
+  if (drawer) {
+    return (
+      <DrawerHeader className="text-left">
+        <DrawerTitle>{t("title")}</DrawerTitle>
+        <DrawerDescription className="sr-only">
+          Select photos and videos to upload to the current photo list.
+        </DrawerDescription>
+      </DrawerHeader>
+    )
+  }
+
+  return (
+    <DialogHeader>
+      <DialogTitle>{t("title")}</DialogTitle>
+      <DialogDescription className="sr-only">
+        Select photos and videos to upload to the current photo list.
+      </DialogDescription>
+    </DialogHeader>
+  )
+}
+
+// 把已解码封面直接画到画布，避免再编码成图片地址。
+function PhotoUploadCover({ cover, name }: { cover: ImageBitmap; name: string }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null) // 显示预览封面的画布。
+
+  useEffect(() => {
+    canvasRef.current?.getContext("2d")?.drawImage(cover, 0, 0)
+  }, [cover])
+
+  return (
+    <canvas
+      ref={canvasRef}
+      width={COVER_SIZE}
+      height={COVER_SIZE}
+      role="img"
+      aria-label={name}
+      className="h-full w-full"
+    />
+  )
+}
+
+// 渲染一个虚拟格子。进入视口后才生成封面。
+const PhotoUploadCell = memo(function PhotoUploadCell({ data, width }: RenderComponentProps<UploadGridItem>) {
+  const apiRef = useContext(UploadGridContext) // 格子与列表共享的添加文件和回写封面方法。
+  const preview = isUploadPreview(data) ? data : null // 文件格子的数据，添加按钮没有这项。
+  const isVideo = preview ? getMediaType(preview.file).startsWith("video/") : false // 视频格子在封面左上角标出播放图标。
+  const StatusIcon = preview ? STATUS_ICON[preview.status as keyof typeof STATUS_ICON] : null // 上传结果角标。
+
+  useEffect(() => {
+    const api = apiRef?.current
+    if (!api || !preview || preview.cover !== undefined || api.loadingIds.has(preview.id)) {
+      return
+    }
+
+    const { id, file } = preview
+    const controller = new AbortController() // 格子离开视口时取消，把封面生成让给还看得到的格子。
+    api.loadingIds.add(id)
+    const generation = api.generationRef.current
+    createPhotoCover(file, controller.signal).then((cover) => {
+      if (cover === null) {
+        console.error(file.name)
+      }
+      api.onCover(id, cover, generation)
+    }).catch((error: unknown) => {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        return
+      }
+      console.error(file.name, error)
+      api.onCover(id, null, generation)
+    })
+
+    return () => {
+      controller.abort()
+      api.loadingIds.delete(id)
+    }
+  }, [apiRef, preview?.id, preview?.cover])
+
+  if (!preview) {
+    return (
+      <button
+        type="button"
+        className="flex w-full items-center justify-center bg-muted text-muted-foreground hover:bg-muted/80"
+        style={{ height: width }}
+        onClick={() => apiRef?.current.onAddPhoto()}
+      >
+        <PlusIcon />
+        <span className="sr-only">Add photos</span>
+      </button>
+    )
+  }
+
+  return (
+    <div className="relative w-full overflow-hidden bg-muted" style={{ height: width }}>
+      {preview.cover ? (
+        <PhotoUploadCover cover={preview.cover} name={preview.file.name} />
+      ) : null}
+      {isVideo && (
+        <Video
+          className="pointer-events-none absolute top-[7px] left-[7px] z-10 size-4.5 text-white"
+          style={{
+            filter: "drop-shadow(0 1px 2px rgba(0,0,0,0.4)) drop-shadow(0 0 1px rgba(0,0,0,0.3))",
+          }}
+          aria-hidden
+        />
+      )}
+      {preview.progress < 100 && (
+        <div
+          className="pointer-events-none absolute inset-x-0 bottom-0 bg-black/60 transition-[height] duration-200"
+          style={{ height: `${100 - preview.progress}%` }}
+        />
+      )}
+      {StatusIcon && (
+        <div className="absolute right-1 bottom-1 flex size-5 items-center justify-center rounded-full bg-black/60 text-white">
+          <StatusIcon className="size-3.5" />
+        </div>
+      )}
+    </div>
+  )
+})
+
+// 用 masonic 渲染上传预览。只有进入视口的格子会挂载并加载封面。
+function PhotoUploadGrid({ previews, generationRef, isMobile, onAddPhoto, onCover }: PhotoUploadGridProps) {
+  const loadingIds = useRef(new Set<string>()) // 已经开始生成封面的预览 id。
+  const apiRef = useRef<UploadGridApi>({ // 传给格子的稳定引用，避免虚拟列表反复挂载。
+    onAddPhoto,
+    onCover,
+    generationRef,
+    loadingIds: loadingIds.current,
+  })
+  const { hostRef, viewportRef, scrollTop, width, height } = useUploadScroller(isMobile)
+  const columns = isMobile ? 3 : 4 // 手机 3 列，桌面 4 列。
+  const items = useMemo<UploadGridItem[]>(() => [...previews, ADD_ITEM], [previews]) // 预览加上末尾的添加按钮。
+  const positioner = usePositioner(
+    {
+      width,
+      columnWidth: 80,
+      columnCount: columns,
+      columnGutter: 4,
+      rowGutter: 4,
+    },
+    [columns, items.length],
+  )
+
+  apiRef.current.onAddPhoto = onAddPhoto
+  apiRef.current.onCover = onCover
+  if (previews.length === 0) {
+    loadingIds.current.clear()
+  }
+
+  syncUploadPositioner(items.length, positioner.columnWidth, positioner)
+
+  const grid = useMasonry({ // 只挂载可见范围附近的格子。
+    positioner,
+    items,
+    height: Math.max(height, 1),
+    scrollTop,
+    itemKey: (item) => item.id,
+    itemHeightEstimate: positioner.columnWidth || 160,
+    overscanBy: 1,
+    render: PhotoUploadCell,
+  })
+
+  return (
+    <UploadGridContext.Provider value={apiRef}>
+      <div ref={hostRef} className="h-full min-h-0 w-full">
+        <div ref={viewportRef} className="h-full w-full overflow-y-auto">
+          {positioner.columnWidth > 0 && grid}
+        </div>
+      </div>
+    </UploadGridContext.Provider>
+  )
+}
+
+// 渲染文件选择、存储配置和上传操作按钮。
+function PhotoUploadFooter({
+  fileInputRef,
+  storages,
+  selectedStorageId,
+  uploading,
+  onFileChange,
+  onStorageChange,
+  onSettingsChange,
+  onReset,
+  onUploadAction,
+}: PhotoUploadFooterProps) {
+  const t = useTranslations("photos.upload")
+
+  return (
+    <>
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*,video/*,.mkv,.mts,.m2ts"
+        multiple
+        className="hidden"
+        onChange={onFileChange}
+      />
+      <div className="flex items-center gap-2">
+        <Select
+          value={selectedStorageId ?? undefined}
+          onValueChange={onStorageChange}
+          disabled={uploading}
+        >
+          <SelectTrigger className="w-40">
+            <SelectValue placeholder={t("selectStorage")} />
+          </SelectTrigger>
+          <SelectContent>
+            {storages.map((storage) => (
+              <SelectItem key={storage.storageId} value={storage.storageId}>
+                {storage.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Popover>
+          <PopoverTrigger asChild>
+            <Button type="button" variant="ghost" size="icon" aria-label="Upload settings">
+              <SettingsIcon className="size-4" />
+            </Button>
+          </PopoverTrigger>
+          <PopoverContent side="top" align="start" className="w-64">
+            <PhotoUploadSettings onChange={onSettingsChange} />
+          </PopoverContent>
+        </Popover>
+      </div>
+      <div className="flex items-center gap-2">
+        {!uploading && (
+          <Button type="button" variant="secondary" onClick={onReset}>
+            {t("clear")}
+          </Button>
+        )}
+        <Button type="button" onClick={onUploadAction}>
+          {uploading ? t("pause") : t("start")}
+        </Button>
+      </div>
+    </>
+  )
+}
